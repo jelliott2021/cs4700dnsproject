@@ -1,0 +1,235 @@
+#!/usr/bin/env -S python3 -u
+
+import argparse
+import socket
+import sys
+import select
+from dnslib import DNSRecord, RR, QTYPE, A, CNAME, NS, MX, TXT, SOA
+from dnslib.dns import DNSHeader, RCODE
+import time
+
+
+class Server:
+    def __init__(self, root_ip, zone_file, port):
+        self.root_ip = root_ip
+        self.port = port
+        self.domain = None
+        self.zone = self.load_zone_file(zone_file)
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket.bind(("0.0.0.0", port if port > 0 else 0))
+        self.port = self.socket.getsockname()[1]
+        self.log(f"Bound to port {self.port}")
+        self.cache = {}
+
+    def log(self, message):
+        sys.stderr.write(message + "\n")
+        sys.stderr.flush()
+
+    def send(self, addr, message):
+        self.log(f"Sending message to {addr}:\n{message}")
+        self.socket.sendto(message.pack(), addr)
+
+    def recv(self, sock):
+        data, addr = sock.recvfrom(65535)
+        request = DNSRecord.parse(data)
+        self.log(f"Received query from {addr}:\n{request}")
+
+        try:
+            response = self.process_request(request)
+        except Exception as e:
+            self.log(f"Error processing request: {e}")
+            response = request.reply()
+            response.header.rcode = RCODE.SERVFAIL
+
+        self.send(addr, response)
+
+    def load_zone_file(self, zone_file):
+        zone = {}
+        current_origin = ""
+        ttl = 3600
+        previous_label = None
+        buffer = ""
+
+        with open(zone_file, "r") as f:
+            for line in f:
+                line = line.split(";")[0]
+                line = line.strip()
+                if not line or line.startswith(";"):
+                    continue
+                if line.startswith("$ORIGIN"):
+                    current_origin = line.split()[1].strip(".")
+                    self.domain = current_origin
+                    continue
+                if line.startswith("$TTL"):
+                    ttl = int(line.split()[1])
+                    continue
+                if "(" in line and ")" not in line:
+                    buffer = line
+                    continue
+                elif ")" in line:
+                    buffer += " " + line
+                    parts = buffer.split()
+                    parts.remove("(")
+                    parts.remove(")")
+                    buffer = ""
+                    label = parts[0]
+                    full_label = f"{label}.{current_origin}" if label != "@" else current_origin
+                    record_type = parts[2]
+                    value = " ".join(parts[3:])
+                    zone.setdefault(full_label, []).append((record_type, value, ttl))
+                    previous_label = label
+                    continue
+                elif buffer:
+                    buffer += " " + line
+                    continue
+                parts = line.split()
+                if len(parts) < 3:
+                    self.log(f"Skipping invalid line: {line}")
+                    continue
+                if parts[0] == "IN":
+                    label = previous_label
+                    record_type = parts[1]
+                    value = " ".join(parts[2:])
+                else:
+                    label = parts[0]
+                    record_type = parts[2]
+                    value = " ".join(parts[3:])
+
+                full_label = f"{label}.{current_origin}" if label != "@" else current_origin
+                zone.setdefault(full_label, []).append((record_type, value, ttl))
+                previous_label = label
+        self.log(f"Loaded zone file: {zone}")
+        return zone
+
+
+
+
+
+    def process_request(self, request):
+        query = request.questions[0]
+        qname = str(query.qname).strip(".")
+        qtype = QTYPE[query.qtype]
+        self.log(f"Processing query: {qname} {qtype}")
+        if qname in self.zone:
+            return self.authoritative_response(request, qname, qtype)
+        cached_response = self.check_cache(qname, qtype)
+        if cached_response:
+            return cached_response
+        return self.recursive_resolve(request, qname, qtype)
+
+    def authoritative_helper(self, request, qname, qtype):
+        self.log(f"Generating authoritative response for {qname} {qtype}")
+        response = request.reply()
+
+        if qname in self.zone:
+            for record_type, rdata, ttl in self.zone[qname]:
+                self.log(f"Checking record: recordtype: {record_type} rdata: {rdata} ttl: {ttl}")
+                found = True
+                if record_type == "A":
+                    response.add_answer(RR(qname, QTYPE.A, ttl=ttl, rdata=A(rdata)))
+                elif record_type == "CNAME":
+                    host = rdata + "." + self.domain
+                    response.add_answer(RR(qname, QTYPE.CNAME, ttl=ttl, rdata=CNAME(host)))
+                    cname_response = self.authoritative_helper(request, host, qtype)
+                    response.add_answer(*cname_response.rr)
+                elif record_type == "MX":
+                    priority, host = rdata.split()
+                    response.add_answer(RR(qname, QTYPE.MX, ttl=ttl, rdata=MX(host, int(priority))))
+                    mx_response = self.authoritative_helper(request, host, qtype)
+                    response.add_answer(*mx_response.rr)
+                if not found:
+                    response.header.rcode = RCODE.NXDOMAIN
+        return response
+    
+    def authoritative_response(self, request, qname, qtype):
+        response = self.authoritative_helper(request, qname, qtype)
+        if qname in self.zone:
+            found = False
+            if self.domain in self.zone:
+                for record_type, rdata, ttl in self.zone[self.domain]:
+                    if record_type == "NS":
+                        response.add_auth(RR(self.domain, QTYPE.NS, ttl=ttl, rdata=NS(rdata)))
+            for auth_rr in response.auth:
+                ns_name = str(auth_rr.rdata)
+                if ns_name in self.zone:
+                    for record_type, rdata, ttl in self.zone[ns_name]:
+                        if record_type == "A":
+                            response.add_ar(RR(ns_name, QTYPE.A, ttl=ttl, rdata=A(rdata)))
+        self.log(f"Generated response:\n{response}")
+        return response
+    
+    def resolve_cname(self, qname):
+        resolved_name = qname
+        while resolved_name in self.zone:
+            for record_type, rdata, _ in self.zone[resolved_name]:
+                if record_type == "CNAME":
+                    resolved_name = rdata.strip(".")
+                    break
+            else:
+                break
+        return resolved_name
+
+    def check_cache(self, qname, qtype):
+        key = (qname, qtype)
+        if key in self.cache:
+            cached_response, expires = self.cache[key]
+            if time.time() < expires:
+                self.log(f"Cache hit for {qname} {qtype}")
+                return cached_response
+            else:
+                del self.cache[key]
+        return None
+    
+    def recursive_resolve(self, request, qname, qtype):
+        response = request.reply()
+        current_server = self.root_ip
+
+        while True:
+            query = DNSRecord.question(qname, getattr(QTYPE, qtype))
+            self.log(f"Querying {current_server} for {qname} {qtype}")
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.settimeout(2)
+            sock.sendto(query.pack(), (current_server, 60053))
+            try:
+                data, _ = sock.recvfrom(65535)
+                server_response = DNSRecord.parse(data)    
+                self.cache_response(qname, qtype, server_response)
+                if server_response.header.get_rcode() == RCODE.NOERROR and server_response.rr:
+                    response.add_answer(*server_response.rr)
+                    break
+                ns_records = server_response.auth
+                additional = {rr.rname: rr for rr in server_response.ar}
+                if ns_records:
+                    ns_name = str(ns_records[0].rdata)
+                    if ns_name in additional:
+                        current_server = str(additional[ns_name].rdata)
+                    else:
+                        current_server = socket.gethostbyname(ns_name)
+                else:
+                    response.header.rcode = RCODE.SERVFAIL
+                    break
+            except socket.timeout:
+                response.header.rcode = RCODE.SERVFAIL
+                break
+        return response
+    
+    def cache_response(self, qname, qtype, response):
+        ttl = min(rr.ttl for rr in response.rr) if response.rr else 0
+        expires = time.time() + ttl
+        self.cache[(qname, qtype)] = (response, expires)
+    
+    def run(self):
+        while True:
+            socks = select.select([self.socket], [], [], 0.1)[0]
+            for conn in socks:
+                self.recv(conn)
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Recursive and Authoritative DNS Server")
+    parser.add_argument("root_ip", type=str, help="The IP address of the root server")
+    parser.add_argument("zone", type=str, help="The zone file for this server")
+    parser.add_argument("--port", type=int, help="The port this server should bind to", default=0)
+    args = parser.parse_args()
+
+    server = Server(args.root_ip, args.zone, args.port)
+    server.run()
